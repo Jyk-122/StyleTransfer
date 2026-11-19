@@ -1,0 +1,11 @@
+# Install into the evaluation environment, not blindly over an existing training environment.
+# Select the torch/torchvision wheels for your CUDA version first.
+torch>=2.6
+torchvision>=0.21
+transformers==4.57.6
+accelerate>=1.0,<2
+Pillow>=10
+numpy>=1.26
+safetensors>=0.4
+huggingface_hub>=0.34,<1
+git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6
