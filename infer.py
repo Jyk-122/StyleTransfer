@@ -15,6 +15,7 @@ import time
 
 from eval.common import fingerprint, local_model_identity, read_image, runtime_versions, sha256_file, write_json, write_jsonl
 from eval.generate import make_pipeline
+from image_sizes import add_reference_size_arguments, prepare_reference_images, reference_size_settings
 
 PROMPT = ("Transfer the visual style of image 2 to image 1 while preserving the content, "
           "structure, objects and layout of image 1.")
@@ -42,6 +43,7 @@ def parser():
     p.add_argument("--cfg", type=float, default=1.0)
     p.add_argument("--height", type=int, default=768)
     p.add_argument("--width", type=int, default=768)
+    add_reference_size_arguments(p)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     p.add_argument("--plan-only", action="store_true", help="Check references and write the manifest without loading FLUX")
@@ -49,10 +51,12 @@ def parser():
 
 
 def build_cases(args):
+    reference_sizes = reference_size_settings(args)
     settings = {key: getattr(args, key) for key in ("alpha", "seed", "steps", "cfg", "height", "width", "dtype", "device")}
     settings.update(model_path=str(args.model_path), lora_path=str(args.lora_path) if args.lora_path else None,
                     alpha=args.alpha if args.lora_path else 0.0, output_format="raw_png",
-                    edit_image_auto_resize=True, embedded_guidance=4.0, rand_device="cpu")
+                    edit_image_auto_resize=reference_sizes is None, reference_sizes=reference_sizes,
+                    embedded_guidance=4.0, rand_device="cpu")
     cases = []
     for i in range(args.content_count):
         for j in range(args.style_count):
@@ -88,6 +92,7 @@ def save_outputs(output_dir, row, content, style, result, size):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    reference_sizes = reference_size_settings(args)
     cache = None
     if args.prompt_embedding_path is not None:
         from fixed_prompt import load_prompt_cache, make_cached_pipeline
@@ -119,7 +124,7 @@ def main(argv=None):
                      "lora_sha256": sha256_file(args.lora_path) if args.lora_path else None,
                      "model_identity": local_model_identity(args.model_path), "runtime": runtime_versions(),
                      "implementation": {name: sha256_file(root / name) for name in (
-                         "infer.py", "eval/generate.py", "eval/common.py", "diffsynth/pipelines/flux2_image.py", "fixed_prompt.py")}}
+                         "infer.py", "eval/generate.py", "eval/common.py", "diffsynth/pipelines/flux2_image.py", "fixed_prompt.py", "image_sizes.py")}}
     identity = fingerprint(specification)
     config_path = args.output_dir / "infer_config.json"
     if config_path.exists():
@@ -149,10 +154,16 @@ def main(argv=None):
     if args.device.startswith("cuda"):
         torch.cuda.synchronize(args.device)
     load_seconds = time.perf_counter() - load_start
+
+    def generate(content, style):
+        return pipe(prompt=args.prompt,
+                    edit_image=prepare_reference_images([content, style], reference_sizes),
+                    edit_image_auto_resize=reference_sizes is None, seed=args.seed,
+                    num_inference_steps=args.steps, cfg_scale=args.cfg, height=args.height, width=args.width)
+
     for _ in range(args.warmup_runs):
         row = pending[0]
-        pipe(prompt=args.prompt, edit_image=[images[row["content"]], images[row["style"]]], seed=args.seed,
-             num_inference_steps=args.steps, cfg_scale=args.cfg, height=args.height, width=args.width)
+        generate(images[row["content"]], images[row["style"]])
     times = []
     for index, row in enumerate(pending):
         try:
@@ -160,8 +171,7 @@ def main(argv=None):
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize(args.device)
             start = time.perf_counter()
-            result = pipe(prompt=args.prompt, edit_image=[content, style], seed=args.seed,
-                          num_inference_steps=args.steps, cfg_scale=args.cfg, height=args.height, width=args.width)
+            result = generate(content, style)
             if args.device.startswith("cuda"):
                 torch.cuda.synchronize(args.device)
             elapsed = time.perf_counter() - start

@@ -93,13 +93,7 @@ python infer.py --model-path "$MODEL_DIR" \
 
 缓存入口仅增加到根目录 `infer.py`；`python -m eval.generate` 保持原来的文本路径。两种模式生成的 `manifest.jsonl` 均可继续交给评测工具。此实现限定 CFG 1；不导出负提示词缓存。
 
-无需模型权重的 CPU 回归检查：
-
-```bash
-python -m unittest -v test_fixed_prompt eval.tests.test_infer eval.tests.test_evaluation
-```
-
-其中小型 DiT 检查 4 步预测/输出一致性、LoRA 训练损失/梯度一致性以及模型加载范围；真实 4B checkpoint 的画质与加速比例仍需服务器实测。
+开发临时测试集中在本地 `dev_tests/`，由 Git 忽略，不随工程部署。真实 4B checkpoint 的画质与加速比例仍需服务器实测。
 
 先把参考图放到 `--references-dir`，默认命名 `content_00.png`…`content_09.png` 和 `style_00.png`…`style_09.png`，再运行：
 
@@ -254,12 +248,6 @@ python -m eval.compare \
 
 DINO 和 CSD 使用各自官方预处理中的中心裁剪，画面边缘可能没被特征覆盖；人物计数等细节需要结合看完整图的 Qwen 和人工核对。CSD 官方仓库目前提示公开权重分数与论文存在差异，因此这里用于**固定权重下的相对比较**，不直接与论文表格绝对数值对标。[CSD 官方实现](https://github.com/learn2phoenix/CSD)
 
-## 验证代码
-
-```bash
-python -m unittest discover -s eval/tests -v
-```
-
-使用小型随机本地模型、合成图片和模拟 API：验证 DINO 的 CLS 特征、CSD 风格头与原计算路径一致、checkpoint 加载、本地 Qwen 三图 processor/generate 接口、图像顺序、评分解析、缓存失效、缺图覆盖率、生成续跑和实验比较。无需下载正式权重。它们验证实现接口和数据流，不能证明真实评分与人类偏好一致；正式环境仍应先跑 5–20 条样本进行人工校准。
+正式环境建议先跑 5–20 条样本进行人工校准；开发测试验证实现接口和数据流，不能证明真实评分与人类偏好一致。
 
 参考：[DINOv2 模型接口](https://huggingface.co/facebook/dinov2-base)、[CSD 模型与论文](https://huggingface.co/tomg-group-umd/CSD-ViT-L)、[Qwen3-VL 官方用法](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)。

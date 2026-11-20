@@ -1,4 +1,10 @@
 import torch, os, argparse, accelerate
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from image_sizes import (add_reference_size_arguments, reference_size_settings,
+                         validate_height_width, ReferenceImageLoader)
 from diffsynth.core import UnifiedDataset
 from diffsynth.pipelines.flux2_image import Flux2ImagePipeline, ModelConfig
 from diffsynth.diffusion import *
@@ -25,16 +31,18 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         device="cpu",
         task="sft",
         prompt_embedding_path=None,
+        reference_sizes=None,
     ):
         super().__init__()
+        if reference_sizes is not None and task.endswith(":train"):
+            raise ValueError("Reference sizes must be set with raw images (sft or :data_process); "
+                             "regenerate preprocessed data before :train")
+        self.reference_sizes = reference_sizes
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, quant_options=quant_options, device=device)
         self.fixed_prompt_text = None
         if prompt_embedding_path is not None:
             # This optional project helper lives outside the DiffSynth package.
-            import sys
-            from pathlib import Path
-            sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
             from fixed_prompt import load_prompt_cache, without_text_encoder_configs, attach_fixed_prompt
             if task.endswith(":train") or any("text_encoder" in name for name in (trainable_models or "", lora_base_model or "")):
                 raise ValueError("Use the fixed prompt cache with raw-data DiT training (sft), not text-encoder training or :train")
@@ -96,6 +104,10 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        if self.reference_sizes is not None:
+            if "edit_image" not in inputs_shared:
+                raise ValueError("Reference size options require --extra_inputs edit_image")
+            inputs_shared["edit_image_auto_resize"] = False
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
@@ -111,39 +123,52 @@ def flux2_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser = add_general_config(parser)
     parser = add_image_size_config(parser)
+    parser = add_reference_size_arguments(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--prompt_embedding_path", type=str, default=None, help="Fixed Klein-4B prompt cache; skip text encoder and tokenizer.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     return parser
 
 
-if __name__ == "__main__":
-    parser = flux2_parser()
-    args = parser.parse_args()
-
-    accelerator = accelerate.Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
-    )
-    dataset = UnifiedDataset(
+def build_dataset(args):
+    reference_sizes = reference_size_settings(args)
+    validate_height_width(args.height, args.width, "target")
+    if args.max_pixels < 256:
+        raise ValueError("Target max_pixels must be at least 256")
+    if reference_sizes is not None:
+        if args.dataset_metadata_path is None or args.task.endswith(":train"):
+            raise ValueError("Reference sizes require raw image metadata; regenerate preprocessed data first")
+        if "edit_image" not in args.data_file_keys.split(",") or "edit_image" not in (args.extra_inputs or "").split(","):
+            raise ValueError("Reference size options require edit_image in --data_file_keys and --extra_inputs")
+    return UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
         main_data_operator=UnifiedDataset.default_image_operator(
-            base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
-        )
+            base_path=args.dataset_base_path, max_pixels=args.max_pixels,
+            height=args.height, width=args.width, height_division_factor=16, width_division_factor=16,
+        ),
+        special_operator_map={"edit_image": ReferenceImageLoader(args.dataset_base_path, reference_sizes)}
+        if reference_sizes is not None else None,
+    )
+
+
+if __name__ == "__main__":
+    parser = flux2_parser()
+    args = parser.parse_args()
+    dataset = build_dataset(args)
+
+    accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
     model = Flux2ImageTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
         prompt_embedding_path=args.prompt_embedding_path,
+        reference_sizes=reference_size_settings(args),
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,

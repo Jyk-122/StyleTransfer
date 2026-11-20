@@ -65,3 +65,52 @@ CUDA_VISIBLE_DEVICES=0 python infer.py \
 - `timing.json`：`conditioning_mode` 应为 `cached`；`mean_pipeline_seconds` 和 `median_pipeline_seconds` 为本次成功生成的平均/中位耗时，排除了模型加载、预热和图片读写。模型加载耗时单独记录在 `pipeline_load_seconds`。
 
 `--warmup-runs 1` 会先额外运行一次，不保存这次结果、不计入正式生成耗时。重复运行会跳过已有且校验通过的结果；重新测速或改变参数时，请使用新的 `OUTPUT_DIR`。
+
+## 3. 独立控制生成图、内容图和风格图尺寸
+
+训练入口和 `infer.py` 都支持下面的参数，文本输入模式与 prompt cache 模式通用。新参数同时接受连字符和下划线写法，例如 `--style-height` 与 `--style_height` 等价。
+
+| 图像角色 | 固定尺寸参数 | 按原图比例限制像素数 |
+| --- | --- | --- |
+| 生成图；训练时对应监督目标 `image` | `--height`、`--width` | 训练可省略宽高，使用原有 `--max_pixels`；推理仍指定宽高 |
+| 内容参考 `edit_image[0]` | `--content-height`、`--content-width` | `--content-max-pixels` |
+| 风格参考 `edit_image[1]` | `--style-height`、`--style-width` | `--style-max-pixels` |
+
+- 固定宽高必须成对指定，且都是正的 16 的倍数。处理方式为等比例缩放后中心裁剪；若目标宽高比与原图不同，会裁掉部分边缘。
+- 参考图的 `max-pixels` 与其固定宽高互斥：保留原图比例缩小，宽高向下对齐到 16，不放大小图。对齐可能产生少量边缘裁剪。
+- 启用任一参考尺寸参数后，参考图直接从原图独立处理，训练目标的尺寸不会覆盖参考尺寸；pipeline 自动缩放会关闭，避免重新放大到 1024²。未配置的另一类参考图仍使用约 1024² 面积、保持原图比例的默认规则。
+- 不传任何新的参考尺寸参数时，沿用原有处理路径，包括训练中通用数据预处理的行为。
+
+例如：生成图/训练目标为 `768×768`，内容图为 `1024×1024`，风格图为 `512×512`。先确认 `train.sh` 中的数据和模型路径，再从工程根目录运行：
+
+```bash
+bash train.sh \
+  --height 768 --width 768 \
+  --content-height 1024 --content-width 1024 \
+  --style-height 512 --style-width 512 \
+  --output_path ./models/style_transfer/FLUX.2-klein-4B_lora_c1024_s512_o768
+```
+
+`train.sh` 会把末尾参数传给训练入口，因此也可以覆盖脚本中的同名参数。原来的数据路径、学习率、prompt cache 等设置仍由脚本提供。
+
+对应推理命令如下，路径变量沿用上文：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python infer.py \
+  --model-path "$MODEL_DIR" \
+  --lora-path "$LORA_PATH" \
+  --prompt-embedding-path "$PROMPT_CACHE" \
+  --references-dir "$REFERENCES_DIR" \
+  --height 768 --width 768 \
+  --content-height 1024 --content-width 1024 \
+  --style-height 512 --style-width 512 \
+  --steps 4 --cfg 1 --alpha 0.5 --seed 0 \
+  --dtype bfloat16 --warmup-runs 1 \
+  --output-dir ./outputs/prompt_cache_c1024_s512_o768
+```
+
+推理训练后的新 checkpoint 时，将 `LORA_PATH` 改为新训练输出目录中的实际权重文件。若希望参考图保持原图比例，可把两组参考宽高替换为 `--content-max-pixels 1048576 --style-max-pixels 262144`。生成图的宽高仍单独设置。
+
+仅改变图像尺寸无需重新导出 prompt cache。尺寸设置会记录在推理配置和 manifest 中，改变尺寸请使用新的输出目录。计时包含参考图缩放，与原先在 pipeline 内缩放的计时范围一致。
+
+这些参考尺寸参数用于原始图片训练或 `:data_process` 预处理；已有 `:train` 预处理数据中的 latent 尺寸已固定，要换尺寸需重新预处理。
