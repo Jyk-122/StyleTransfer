@@ -35,6 +35,8 @@ pip install -r eval/requirements.txt
 
 ## 接入当前 `infer.py`
 
+固定 prompt 可使用根目录 `fixed_prompt.py` 的缓存封装，见下方“固定 prompt 缓存”。该模式只替换所创建 pipeline 实例的文本编码单元，DiffSynth 的 pipeline、DiT 和损失源码保持原样。
+
 根目录 `infer.py` 按内容图 × 风格图生成所有组合，默认保留原来的 4×4、step2000、alpha=0.5、4 步、CFG 1。现在每组输出：
 
 ```text
@@ -50,6 +52,54 @@ pip install -r eval/requirements.txt
 ```
 
 旧版本只有 `*_triplet.jpg`，不能把整张拼图当作生成结果送入评测。重跑新版会补齐单独的 PNG 和清单。`--output-pattern` 的单一 metadata 索引不适合这个双索引网格，直接用自动生成的 `--manifest`。
+
+### 固定 prompt 缓存
+
+在仓库根目录使用现有 DiffSynth 训练环境执行。先离线导出一次；这一步只加载 Qwen3，不加载 DiT/VAE：
+
+```bash
+MODEL_DIR=/data3/jiangyikun/AIGC/models/FLUX.2-klein-4B
+python export_prompt_embedding.py \
+  --model-path "$MODEL_DIR" \
+  --output ./models/style_transfer/fixed_prompt_bf16.safetensors
+```
+
+默认指令与本工程 StyleExpert 转换脚本、`infer.py` 一致；也可传 `--prompt '你的固定指令'`。缓存保存完整的 `[1, 512, 7680]` embedding、位置坐标、原提示词及编码器/tokenizer 来源信息。它只适用于 Klein-4B，不能裁掉 padding 或换用另一种编码精度。更换编码器权重、tokenizer、模板或提示词时重新导出。来源清单使用配置哈希及权重大小/修改时间，非完整权重校验和。
+
+训练时，在现有 `examples/flux2/model_training/train.py` 命令末尾加：
+
+```bash
+  --prompt_embedding_path ./models/style_transfer/fixed_prompt_bf16.safetensors
+```
+
+缓存模式会在加载模型前剔除标准 `text_encoder/` 权重配置，并跳过 tokenizer；也可以直接从 `--model_id_with_origin_paths` 中删去 `text_encoder/*.safetensors` 条目，仅提供 transformer 和 VAE。自定义命名的编码器权重请自行移出模型列表。数据可以省略 `prompt`；若保留该字段，必须与缓存原文一致，否则报错。带不同内容描述的样本不能共用一份固定缓存。此参数用于普通 `sft` 或预处理 `sft:data_process`；已有的 `sft:train` 使用它自己的预处理数据，不要重复传此参数。不传新参数就沿用原来的文本模式。
+
+推理比较使用同一 checkpoint、alpha、输入、seed 和分辨率，分两个新目录运行。下面沿用 `infer.py` 的默认 checkpoint 和参考图目录，服务器上按实际路径传 `--lora-path`、`--references-dir`：
+
+```bash
+# 原文本路径：加载 Qwen3，逐次编码同一提示词
+python infer.py --model-path "$MODEL_DIR" \
+  --steps 4 --cfg 1 --seed 0 --alpha 0.5 --warmup-runs 1 \
+  --output-dir ./outputs/prompt_text
+
+# 缓存路径：只加载 DiT/VAE，使用导出的固定条件
+python infer.py --model-path "$MODEL_DIR" \
+  --steps 4 --cfg 1 --seed 0 --alpha 0.5 --warmup-runs 1 \
+  --prompt-embedding-path ./models/style_transfer/fixed_prompt_bf16.safetensors \
+  --output-dir ./outputs/prompt_cached
+```
+
+两边均输出原始 PNG、清单和 `timing.json`。对比 `mean_pipeline_seconds` / `median_pipeline_seconds`；CUDA 在计时前后同步，正式生成耗时不含模型加载、预热和图片读写。`pipeline_load_seconds` 单独记录模型构造及 LoRA 加载耗时。`--warmup-runs` 默认 0，为比较稳定耗时建议显式设 1 或更多。缓存文件的哈希参与续跑校验，换缓存须使用新输出目录；已有结果会跳过生成，不能用续跑代替重新测速。速度须在实际显卡上测量。
+
+缓存入口仅增加到根目录 `infer.py`；`python -m eval.generate` 保持原来的文本路径。两种模式生成的 `manifest.jsonl` 均可继续交给评测工具。此实现限定 CFG 1；不导出负提示词缓存。
+
+无需模型权重的 CPU 回归检查：
+
+```bash
+python -m unittest -v test_fixed_prompt eval.tests.test_infer eval.tests.test_evaluation
+```
+
+其中小型 DiT 检查 4 步预测/输出一致性、LoRA 训练损失/梯度一致性以及模型加载范围；真实 4B checkpoint 的画质与加速比例仍需服务器实测。
 
 先把参考图放到 `--references-dir`，默认命名 `content_00.png`…`content_09.png` 和 `style_00.png`…`style_09.png`，再运行：
 

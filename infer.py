@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 from pathlib import Path
 import sys
 import time
@@ -33,7 +34,9 @@ def parser():
     p.add_argument("--style-count", type=int, default=4)
     p.add_argument("--output-dir", type=Path,
                    default=Path("/data3/jiangyikun/AIGC/StyleTransfer/datasets/outputs/lora_styleexpert_2000"))
-    p.add_argument("--prompt", default=PROMPT)
+    p.add_argument("--prompt", default=None, help="Defaults to the style-transfer instruction or the cached prompt")
+    p.add_argument("--prompt-embedding-path", type=Path, help="Fixed prompt cache; skip text encoder/tokenizer (CFG 1)")
+    p.add_argument("--warmup-runs", type=int, default=0, help="Warmup calls excluded from timing; use 1+ for comparisons")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--cfg", type=float, default=1.0)
@@ -58,7 +61,7 @@ def build_cases(args):
                 "content": str((args.references_dir / args.content_pattern.format(index=i)).resolve()),
                 "style": str((args.references_dir / args.style_pattern.format(index=j)).resolve()),
                 "output": f"out_{i}_{j}.png", "preview": f"out_{i}_{j}_triplet.jpg",
-                "prompt": args.prompt, "seed": args.seed, "generation": settings,
+                "prompt": args.prompt if args.prompt is not None else PROMPT, "seed": args.seed, "generation": settings,
             })
     return cases
 
@@ -85,7 +88,17 @@ def save_outputs(output_dir, row, content, style, result, size):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    cache = None
+    if args.prompt_embedding_path is not None:
+        from fixed_prompt import load_prompt_cache, make_cached_pipeline
+        args.prompt_embedding_path = args.prompt_embedding_path.expanduser().resolve()
+        cache = load_prompt_cache(args.prompt_embedding_path, dtype=args.dtype)
+        if args.cfg != 1 or args.prompt not in (None, cache["prompt"]):
+            raise ValueError("Cache mode requires CFG 1 and a prompt matching the cache")
+    if args.prompt is None:
+        args.prompt = cache["prompt"] if cache is not None else PROMPT
     if (args.content_count < 1 or args.style_count < 1 or args.steps < 1
+            or args.warmup_runs < 0
             or not math.isfinite(args.alpha) or not math.isfinite(args.cfg) or not args.prompt.strip()
             or min(args.height, args.width) < 16 or args.height % 16 or args.width % 16):
         raise ValueError("Invalid counts/parameters; height and width must be positive multiples of 16")
@@ -94,6 +107,9 @@ def main(argv=None):
     args.references_dir = args.references_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     cases = build_cases(args)
+    cases[0]["generation"].update(
+        conditioning_mode="cached" if cache is not None else "text", warmup_runs=args.warmup_runs,
+        prompt_embedding_sha256=sha256_file(args.prompt_embedding_path) if cache is not None else None)
     # Check every reference before loading the generator; wrong naming/counts fail early.
     references = {row[role] for row in cases for role in ("content", "style")}
     images = {path: read_image(path) for path in sorted(references)}
@@ -103,7 +119,7 @@ def main(argv=None):
                      "lora_sha256": sha256_file(args.lora_path) if args.lora_path else None,
                      "model_identity": local_model_identity(args.model_path), "runtime": runtime_versions(),
                      "implementation": {name: sha256_file(root / name) for name in (
-                         "infer.py", "eval/generate.py", "eval/common.py", "diffsynth/pipelines/flux2_image.py")}}
+                         "infer.py", "eval/generate.py", "eval/common.py", "diffsynth/pipelines/flux2_image.py", "fixed_prompt.py")}}
     identity = fingerprint(specification)
     config_path = args.output_dir / "infer_config.json"
     if config_path.exists():
@@ -127,8 +143,16 @@ def main(argv=None):
     if not pending:
         print("All predictions and previews already exist; prediction hashes verified.")
         return 0
-    pipe = make_pipeline(args)
     import torch
+    load_start = time.perf_counter()
+    pipe = make_cached_pipeline(args, cache) if cache is not None else make_pipeline(args)
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize(args.device)
+    load_seconds = time.perf_counter() - load_start
+    for _ in range(args.warmup_runs):
+        row = pending[0]
+        pipe(prompt=args.prompt, edit_image=[images[row["content"]], images[row["style"]]], seed=args.seed,
+             num_inference_steps=args.steps, cfg_scale=args.cfg, height=args.height, width=args.width)
     times = []
     for index, row in enumerate(pending):
         try:
@@ -152,6 +176,14 @@ def main(argv=None):
         print(f"{index + 1}/{len(pending)} {row['id']}: {state[row['id']]['status']}", flush=True)
     if times:
         print(f"Mean pipeline time over {len(times)} new successful pairs: {sum(times) / len(times):.3f}s")
+    write_json(args.output_dir / "timing.json", {
+        "scope": "This invocation; pipeline time excludes loading, warmup, image I/O and saving",
+        "conditioning_mode": "cached" if cache is not None else "text",
+        "pipeline_load_seconds": load_seconds, "warmup_runs": args.warmup_runs,
+        "successful_pairs": len(times), "pipeline_seconds": times,
+        "mean_pipeline_seconds": statistics.mean(times) if times else None,
+        "median_pipeline_seconds": statistics.median(times) if times else None,
+    })
     return int(any(state.get(row["id"], {}).get("status") != "ok" for row in cases))
 
 

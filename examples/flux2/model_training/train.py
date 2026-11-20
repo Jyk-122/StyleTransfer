@@ -24,12 +24,29 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         enable_lora_hot_loading=False,
         device="cpu",
         task="sft",
+        prompt_embedding_path=None,
     ):
         super().__init__()
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, quant_options=quant_options, device=device)
-        tokenizer_config = self.parse_path_or_model_id(tokenizer_path, default_value=ModelConfig(model_id="black-forest-labs/FLUX.2-dev", origin_file_pattern="tokenizer/"))
+        self.fixed_prompt_text = None
+        if prompt_embedding_path is not None:
+            # This optional project helper lives outside the DiffSynth package.
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+            from fixed_prompt import load_prompt_cache, without_text_encoder_configs, attach_fixed_prompt
+            if task.endswith(":train") or any("text_encoder" in name for name in (trainable_models or "", lora_base_model or "")):
+                raise ValueError("Use the fixed prompt cache with raw-data DiT training (sft), not text-encoder training or :train")
+            cache = load_prompt_cache(prompt_embedding_path, dtype="bfloat16")
+            self.fixed_prompt_text = cache["prompt"]
+            model_configs = without_text_encoder_configs(model_configs)
+            tokenizer_config = None
+        else:
+            tokenizer_config = self.parse_path_or_model_id(tokenizer_path, default_value=ModelConfig(model_id="black-forest-labs/FLUX.2-dev", origin_file_pattern="tokenizer/"))
         self.pipe = Flux2ImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config)
+        if prompt_embedding_path is not None:
+            attach_fixed_prompt(self.pipe, cache)
         self.pipe = self.load_training_template_model(self.pipe, template_model_id_or_path, use_gradient_checkpointing, use_gradient_checkpointing_offload)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model, remove_unnecessary_params=True)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
@@ -59,7 +76,10 @@ class Flux2ImageTrainingModule(DiffusionTrainingModule):
         }
 
     def get_pipeline_inputs(self, data):
-        inputs_posi = {"prompt": data["prompt"]}
+        prompt = data["prompt"] if self.fixed_prompt_text is None else data.get("prompt", self.fixed_prompt_text)
+        if self.fixed_prompt_text is not None and prompt != self.fixed_prompt_text:
+            raise ValueError("Metadata prompt does not match the fixed cache")
+        inputs_posi = {"prompt": prompt}
         inputs_nega = {"negative_prompt": ""}
         inputs_shared = {
             # Assume you are using this pipeline for inference,
@@ -92,6 +112,7 @@ def flux2_parser():
     parser = add_general_config(parser)
     parser = add_image_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    parser.add_argument("--prompt_embedding_path", type=str, default=None, help="Fixed Klein-4B prompt cache; skip text encoder and tokenizer.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     return parser
 
@@ -122,6 +143,7 @@ if __name__ == "__main__":
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
+        prompt_embedding_path=args.prompt_embedding_path,
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,
