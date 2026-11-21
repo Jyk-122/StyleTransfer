@@ -38,6 +38,8 @@ def parser():
     p.add_argument("--prompt", default=None, help="Defaults to the style-transfer instruction or the cached prompt")
     p.add_argument("--prompt-embedding-path", type=Path, help="Fixed prompt cache; skip text encoder/tokenizer (CFG 1)")
     p.add_argument("--warmup-runs", type=int, default=0, help="Warmup calls excluded from timing; use 1+ for comparisons")
+    p.add_argument("--profile-components", action="store_true",
+                   help="Time content/style VAE, DiT, decode and total; estimate style VAE cache savings without caching")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--cfg", type=float, default=1.0)
@@ -55,6 +57,7 @@ def build_cases(args):
     settings = {key: getattr(args, key) for key in ("alpha", "seed", "steps", "cfg", "height", "width", "dtype", "device")}
     settings.update(model_path=str(args.model_path), lora_path=str(args.lora_path) if args.lora_path else None,
                     alpha=args.alpha if args.lora_path else 0.0, output_format="raw_png",
+                    profile_components=args.profile_components,
                     edit_image_auto_resize=reference_sizes is None, reference_sizes=reference_sizes,
                     embedded_guidance=4.0, rand_device="cpu")
     cases = []
@@ -124,7 +127,7 @@ def main(argv=None):
                      "lora_sha256": sha256_file(args.lora_path) if args.lora_path else None,
                      "model_identity": local_model_identity(args.model_path), "runtime": runtime_versions(),
                      "implementation": {name: sha256_file(root / name) for name in (
-                         "infer.py", "eval/generate.py", "eval/common.py", "diffsynth/pipelines/flux2_image.py", "fixed_prompt.py", "image_sizes.py")}}
+                         "infer.py", "eval/generate.py", "eval/common.py", "diffsynth/pipelines/flux2_image.py", "fixed_prompt.py", "image_sizes.py", "inference_profile.py")}}
     identity = fingerprint(specification)
     config_path = args.output_dir / "infer_config.json"
     if config_path.exists():
@@ -165,20 +168,31 @@ def main(argv=None):
         row = pending[0]
         generate(images[row["content"]], images[row["style"]])
     times = []
+    component_samples = []
+    if args.profile_components:
+        from inference_profile import profile_inference, summarize_profiles, print_profile_summary
     for index, row in enumerate(pending):
         try:
             content, style = images[row["content"]], images[row["style"]]
-            if args.device.startswith("cuda"):
-                torch.cuda.synchronize(args.device)
-            start = time.perf_counter()
-            result = generate(content, style)
-            if args.device.startswith("cuda"):
-                torch.cuda.synchronize(args.device)
-            elapsed = time.perf_counter() - start
+            components = None
+            if args.profile_components:
+                result, components = profile_inference(pipe, lambda: generate(content, style), args.device)
+                elapsed = components["seconds"]["total"]
+            else:
+                if args.device.startswith("cuda"):
+                    torch.cuda.synchronize(args.device)
+                start = time.perf_counter()
+                result = generate(content, style)
+                if args.device.startswith("cuda"):
+                    torch.cuda.synchronize(args.device)
+                elapsed = time.perf_counter() - start
             save_outputs(args.output_dir, row, content, style, result, (args.width, args.height))
             times.append(elapsed)
             state[row["id"]] = {"status": "ok", "pipeline_seconds": elapsed,
                                 "sha256": sha256_file(args.output_dir / row["output"])}
+            if components is not None:
+                state[row["id"]]["components"] = components
+                component_samples.append({"id": row["id"], **components})
         except Exception as exc:
             state[row["id"]] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
             print(f"{row['id']}: {exc}", file=sys.stderr)
@@ -186,6 +200,9 @@ def main(argv=None):
         print(f"{index + 1}/{len(pending)} {row['id']}: {state[row['id']]['status']}", flush=True)
     if times:
         print(f"Mean pipeline time over {len(times)} new successful pairs: {sum(times) / len(times):.3f}s")
+    component_report = summarize_profiles(component_samples) if args.profile_components else None
+    if component_report is not None:
+        print_profile_summary(component_report)
     write_json(args.output_dir / "timing.json", {
         "scope": "This invocation; pipeline time excludes loading, warmup, image I/O and saving",
         "conditioning_mode": "cached" if cache is not None else "text",
@@ -193,6 +210,7 @@ def main(argv=None):
         "successful_pairs": len(times), "pipeline_seconds": times,
         "mean_pipeline_seconds": statistics.mean(times) if times else None,
         "median_pipeline_seconds": statistics.median(times) if times else None,
+        "component_profile": component_report,
     })
     return int(any(state.get(row["id"], {}).get("status") != "ok" for row in cases))
 

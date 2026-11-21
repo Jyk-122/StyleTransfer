@@ -114,3 +114,52 @@ CUDA_VISIBLE_DEVICES=0 python infer.py \
 仅改变图像尺寸无需重新导出 prompt cache。尺寸设置会记录在推理配置和 manifest 中，改变尺寸请使用新的输出目录。计时包含参考图缩放，与原先在 pipeline 内缩放的计时范围一致。
 
 这些参考尺寸参数用于原始图片训练或 `:data_process` 预处理；已有 `:train` 预处理数据中的 latent 尺寸已固定，要换尺寸需重新预处理。
+
+## 4. 分项计时与风格 VAE cache 时延估计
+
+在现有推理命令中增加 `--profile-components` 即可。它只统计耗时，风格图仍会在每次生成时正常编码，没有实现或模拟 VAE cache，也不改变图像预处理和模型计算。
+
+例如，沿用第 2 节的路径变量，以固定一张风格图、四张内容图进行 4 步、CFG 1 测量：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python infer.py \
+  --model-path "$MODEL_DIR" \
+  --lora-path "$LORA_PATH" \
+  --prompt-embedding-path "$PROMPT_CACHE" \
+  --references-dir "$REFERENCES_DIR" \
+  --content-count 4 --style-count 1 \
+  --height 768 --width 768 \
+  --steps 4 --cfg 1 --alpha 0.5 --seed 0 \
+  --dtype bfloat16 --device cuda \
+  --warmup-runs 1 --profile-components \
+  --output-dir ./outputs/profile_components
+```
+
+不传 `--prompt-embedding-path` 也能计时，此时文本编码会计入 `other`。不传 `--profile-components` 时，保留原来的总时间统计。
+
+终端会显示各项平均耗时和占比。详细结果在 `timing.json` 的 `component_profile` 中：
+
+| `mean_seconds` 字段 | 测量范围 |
+| --- | --- |
+| `content_vae` | 内容图的 `vae.encode` |
+| `style_vae` | 风格图的 `vae.encode` |
+| `dit` | 所有 DiT forward 的累计时间；4 步、CFG 1 时为 4 次 |
+| `decode` | 最终生成 latent 的 `vae.decode` |
+| `other` | 总时间减去上述四项，包括预处理、文本条件、调度、调用外的数据搬运等 |
+| `total` | 一次 pipeline 调用；不含模型加载、预热、参考图文件读取和结果保存 |
+
+`percent_of_total` 给出各项平均耗时占总时间的百分比。`samples` 和 `infer_state.json` 中的 `components` 保存逐组计时、DiT 每次 forward 耗时、VAE 实际输入的 `[B,C,H,W]`、风格 latent 的形状、dtype 和字节数。只汇总本次新生成成功的组合，失败或跳过的组合不计入。
+
+CUDA 在计时边界同步，防止把异步计算的提交时间当成执行时间。同步和计时包装本身会带来额外开销，因此该模式用于组件占比分析；普通推理延迟可另开输出目录、不加此开关测量。预热针对首个待生成组合；其他输入形状的首次调用仍可能包含初始化开销。
+
+`style_vae_cache_estimate` 是缓存已命中时的理想估计：
+
+```text
+预计单次耗时 = 实测总耗时 - 实测风格 VAE 编码耗时
+预计节省比例 = 风格 VAE 编码耗时 / 总耗时
+预计加速倍数 = 总耗时 / (总耗时 - 风格 VAE 编码耗时)
+```
+
+估计假设缓存读取/传输开销为零，只扣除风格 VAE 编码，不扣除风格 token 在 DiT 中的计算，也不额外扣除预处理。第一次构建缓存仍需编码；同一风格复用 N 次时，忽略读取成本的平均估计为 `T_total - (1 - 1/N) * T_style_vae`。实际部署收益需实现 cache 后再测。
+
+当前 FLUX.2 VAE 的 `encode` 使用预测均值，没有随机采样。在风格图及预处理、VAE 权重、编码精度都相同，且缓存保留原 latent 数值的条件下，复用它不会引入额外质量损失；这里不意味着 VAE 压缩本身无损。
